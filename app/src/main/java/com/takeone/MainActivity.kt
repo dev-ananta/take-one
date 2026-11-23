@@ -20,7 +20,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
@@ -65,6 +67,13 @@ private fun App(vm: RecorderViewModel = viewModel()) {
         if (granted) vm.startRecording() else launcher.launch(permissions)
     }
 
+    fun granted(p: String) = ContextCompat.checkSelfPermission(context, p) == PackageManager.PERMISSION_GRANTED
+    var cameraGranted by remember { mutableStateOf(granted(Manifest.permission.CAMERA)) }
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        cameraGranted = ok
+        if (!ok) vm.message = "Without camera access TakeOne records sound only."
+    }
+
     LaunchedEffect(vm.message) {
         vm.message?.let { snack.showSnackbar(it); vm.message = null }
     }
@@ -75,7 +84,12 @@ private fun App(vm: RecorderViewModel = viewModel()) {
     Scaffold(containerColor = Tk.Bg, snackbarHost = { SnackbarHost(snack) }) { pad ->
         Box(Modifier.fillMaxSize().padding(pad)) {
             if (vm.take != null && rec.status == RecStatus.IDLE) EditorScreen(vm)
-            else RecorderScreen(vm, rec, onRecord)
+            else RecorderScreen(
+                vm, rec,
+                cameraPermission = cameraGranted,
+                onRequestCamera = { cameraLauncher.launch(Manifest.permission.CAMERA) },
+                onRecord = onRecord,
+            )
         }
     }
 }

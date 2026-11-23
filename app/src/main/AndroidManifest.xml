@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Live view on Mac (CamLink) streams over the internet -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- Needed to route a Bluetooth headset mic -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- Keeps recording while you switch apps or lock the screen -->
@@ -11,10 +14,12 @@
 
     <uses-feature android:name="android.hardware.microphone" android:required="true" />
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
     <!--
         allowBackup is off and nothing is written to storage: recordings live only in RAM.
-        largeHeap gives room for long takes (about 5.5 MB per minute in memory).
+        largeHeap gives room for long takes (about 5.5 MB per minute of sound in memory).
+        Video goes into RAM-only files (memfd), about 45 MB per minute.
     -->
     <application
         android:allowBackup="false"

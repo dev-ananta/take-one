@@ -27,7 +27,13 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class MemoryAudioProvider : ContentProvider() {
 
-    class Blob(val bytes: ByteArray, val mime: String, val displayName: String)
+    /** Something shareable held in memory: a byte array or a RAM-only file (memfd). */
+    class Blob(
+        val size: Long,
+        val mime: String,
+        val displayName: String,
+        val read: (offset: Long, dst: ByteArray, len: Int) -> Int,
+    )
 
     companion object {
         private val blobs = ConcurrentHashMap<String, Blob>()
@@ -36,10 +42,22 @@ class MemoryAudioProvider : ContentProvider() {
         fun authority(context: Context) = "${context.packageName}.memory"
 
         /** Publishes bytes and returns a shareable Uri. Only the latest export is kept. */
-        fun publish(context: Context, bytes: ByteArray, mime: String, displayName: String): Uri {
+        fun publish(context: Context, bytes: ByteArray, mime: String, displayName: String): Uri =
+            publish(context, Blob(bytes.size.toLong(), mime, displayName) { off, dst, len ->
+                val n = minOf(len.toLong(), bytes.size - off).toInt()
+                System.arraycopy(bytes, off.toInt(), dst, 0, n); n
+            })
+
+        /** Shares a RAM-only file without copying it. The caller keeps it open while sharing. */
+        @androidx.annotation.RequiresApi(30)
+        fun publish(context: Context, file: com.takeone.video.MemFd, mime: String, displayName: String): Uri =
+            publish(context, Blob(file.size, mime, displayName) { off, dst, len -> file.pread(off, dst, len) })
+
+        private fun publish(context: Context, blob: Blob): Uri {
+            val displayName = blob.displayName
             blobs.clear()
             val token = java.util.UUID.randomUUID().toString()
-            blobs[token] = Blob(bytes, mime, displayName)
+            blobs[token] = blob
             return Uri.Builder()
                 .scheme("content")
                 .authority(authority(context))
@@ -66,7 +84,7 @@ class MemoryAudioProvider : ContentProvider() {
             ?.takeIf { it.isNotEmpty() }
             ?: listOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
         return MatrixCursor(cols.toTypedArray(), 1).apply {
-            addRow(cols.map { if (it == OpenableColumns.SIZE) b.bytes.size.toLong() else b.displayName })
+            addRow(cols.map { if (it == OpenableColumns.SIZE) b.size else b.displayName })
         }
     }
 
@@ -78,13 +96,12 @@ class MemoryAudioProvider : ContentProvider() {
             sm.openProxyFileDescriptor(
                 ParcelFileDescriptor.MODE_READ_ONLY,
                 object : ProxyFileDescriptorCallback() {
-                    override fun onGetSize(): Long = b.bytes.size.toLong()
+                    override fun onGetSize(): Long = b.size
                     override fun onRead(offset: Long, size: Int, data: ByteArray): Int {
                         if (offset < 0) throw ErrnoException("onRead", OsConstants.EINVAL)
-                        if (offset >= b.bytes.size) return 0
-                        val n = minOf(size.toLong(), b.bytes.size - offset).toInt()
-                        System.arraycopy(b.bytes, offset.toInt(), data, 0, n)
-                        return n
+                        if (offset >= b.size) return 0
+                        val n = minOf(size.toLong(), b.size - offset).toInt()
+                        return b.read(offset, data, n)
                     }
                     override fun onRelease() {}
                 },
@@ -95,7 +112,15 @@ class MemoryAudioProvider : ContentProvider() {
             val pipe = ParcelFileDescriptor.createReliablePipe()
             Thread {
                 try {
-                    FileOutputStream(pipe[1].fileDescriptor).use { it.write(b.bytes) }
+                    FileOutputStream(pipe[1].fileDescriptor).use { out ->
+                        val chunk = ByteArray(256 * 1024)
+                        var off = 0L
+                        while (off < b.size) {
+                            val n = b.read(off, chunk, minOf(chunk.size.toLong(), b.size - off).toInt())
+                            if (n <= 0) break
+                            out.write(chunk, 0, n); off += n
+                        }
+                    }
                     pipe[1].close()
                 } catch (err: Exception) {
                     try { pipe[1].closeWithError(err.message) } catch (_: Exception) {}
