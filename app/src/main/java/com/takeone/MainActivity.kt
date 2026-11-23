@@ -1,0 +1,81 @@
+package com.takeone
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.takeone.audio.RecStatus
+import com.takeone.audio.Recorder
+import com.takeone.ui.EditorScreen
+import com.takeone.ui.RecorderScreen
+import com.takeone.ui.TakeOneTheme
+import com.takeone.ui.Tk
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
+        setContent { TakeOneTheme { App() } }
+    }
+}
+
+@Composable
+private fun App(vm: RecorderViewModel = viewModel()) {
+    val context = LocalContext.current
+    val rec by Recorder.state.collectAsState()
+    val snack = remember { SnackbarHostState() }
+
+    val permissions = remember {
+        buildList {
+            add(Manifest.permission.RECORD_AUDIO)
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+        }.toTypedArray()
+    }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        if (result[Manifest.permission.RECORD_AUDIO] == true) vm.startRecording()
+        else vm.message = "TakeOne needs microphone access to record."
+    }
+    val onRecord = {
+        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        if (granted) vm.startRecording() else launcher.launch(permissions)
+    }
+
+    LaunchedEffect(vm.message) {
+        vm.message?.let { snack.showSnackbar(it); vm.message = null }
+    }
+    LaunchedEffect(rec.hitLimit) {
+        if (rec.hitLimit) snack.showSnackbar("Reached the ${Recorder.MAX_MINUTES}-minute limit, so recording stopped.")
+    }
+
+    Scaffold(containerColor = Tk.Bg, snackbarHost = { SnackbarHost(snack) }) { pad ->
+        Box(Modifier.fillMaxSize().padding(pad)) {
+            if (vm.take != null && rec.status == RecStatus.IDLE) EditorScreen(vm)
+            else RecorderScreen(vm, rec, onRecord)
+        }
+    }
+}

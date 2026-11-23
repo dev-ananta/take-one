@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#FF0A0A0C</color>
+    <color name="ic_bg">#FF16171B</color>
+    <color name="ic_rec">#FFFF3B30</color>
+    <color name="ic_accent">#FF4FD1C5</color>
+
+    <style name="Theme.TakeOne" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:statusBarColor">@color/bg</item>
+        <item name="android:navigationBarColor">@color/bg</item>
+    </style>
+</resources>
