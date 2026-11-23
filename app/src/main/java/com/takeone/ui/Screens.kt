@@ -131,7 +131,13 @@ private fun PauseGlyph(color: Color = Color.White) {
 // ============================================================================================
 
 @Composable
-fun RecorderScreen(vm: RecorderViewModel, rec: RecState, onRecord: () -> Unit) {
+fun RecorderScreen(
+    vm: RecorderViewModel,
+    rec: RecState,
+    cameraPermission: Boolean,
+    onRequestCamera: () -> Unit,
+    onRecord: () -> Unit,
+) {
     val active = rec.status != RecStatus.IDLE
     Column(
         Modifier
@@ -142,6 +148,10 @@ fun RecorderScreen(vm: RecorderViewModel, rec: RecState, onRecord: () -> Unit) {
     ) {
         Text("TakeOne", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         MemoryBadge()
+
+        // ---- Camera & live view on the Mac ------------------------------------------------
+        CameraCard(vm, recording = active, hasPermission = cameraPermission, onRequestPermission = onRequestCamera)
+        if (vm.videoEnabled && vm.videoSupported && cameraPermission) MacLiveViewCard(vm)
 
         // ---- Microphone picker ----------------------------------------------------------
         Card {
@@ -297,6 +307,7 @@ fun EditorScreen(vm: RecorderViewModel) {
             Text(formatTime(samples.size, rate), color = Tk.Dim, fontFamily = FontFamily.Monospace)
         }
         MemoryBadge()
+        VideoEditorPanel(vm)
 
         OutlinedTextField(
             value = vm.title,
@@ -326,7 +337,11 @@ fun EditorScreen(vm: RecorderViewModel) {
                 }
                 TextButton(onClick = vm::selectAll) { Text("Select all") }
             }
-            Text("Drag the handles to choose a section. Edits apply to the selection.", color = Tk.Dim, fontSize = 12.sp)
+            Text(
+                if (vm.video != null) "Drag the handles to choose a section. Trims and cuts line up with the video's keyframes (about every second)."
+                else "Drag the handles to choose a section. Edits apply to the selection.",
+                color = Tk.Dim, fontSize = 12.sp,
+            )
         }
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
@@ -356,6 +371,8 @@ fun EditorScreen(vm: RecorderViewModel) {
             }
         }
 
+        SyncControl(vm)
+
         vm.busy?.let { label ->
             Column {
                 Text(label + "…", color = Tk.Dim)
@@ -382,7 +399,7 @@ fun EditorScreen(vm: RecorderViewModel) {
             ) { Text("Post…", fontWeight = FontWeight.Bold) }
         }
         Text(
-            "Posting hands the audio to the app you choose (Messages, WhatsApp, Drive, email…) " +
+            "Posting hands the file to the app you choose (Messages, WhatsApp, Drive, email…) " +
                 "directly from memory. Closing TakeOne discards the take.",
             color = Tk.Dim, fontSize = 12.sp,
         )
@@ -390,7 +407,7 @@ fun EditorScreen(vm: RecorderViewModel) {
     }
 
     if (showPost) {
-        var format by remember { mutableStateOf(ExportFormat.AAC) }
+        var format by remember { mutableStateOf(if (vm.videoSupported) ExportFormat.MP4 else ExportFormat.AAC) }
         AlertDialog(
             onDismissRequest = { showPost = false },
             title = { Text("Post recording") },
@@ -411,7 +428,7 @@ fun EditorScreen(vm: RecorderViewModel) {
                     Spacer(Modifier.height(6.dp))
                     val seconds = samples.size.toLong() / rate
                     val est = when (format) {
-                        ExportFormat.WAV -> samples.size * 2L
+                        ExportFormat.MP4 -> seconds * (160_000 + if (vm.video != null) com.takeone.video.CameraController.VIDEO_BITRATE else 0) / 8
                         ExportFormat.AAC -> seconds * 160_000 / 8
                     }
                     Text("About ${"%.1f".format(est / 1_048_576.0)} MB", color = Tk.Dim, fontSize = 13.sp)

@@ -4,23 +4,59 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.min
 
+/** One encoded AAC frame held in memory. */
+class AacFrame(val data: ByteArray, val ptsUs: Long)
+
+/** Encoded audio ready for muxing: the codec's output format (with its config) plus all frames. */
+class AacTrack(val format: MediaFormat, val frames: List<AacFrame>)
+
 /**
- * Encodes PCM to AAC-LC using the phone's hardware/software encoder and wraps each frame in
- * an ADTS header, producing a playable .aac file entirely in memory (no temp files).
+ * Encodes PCM to AAC-LC with the phone's encoder, entirely in memory (no temp files).
  */
 object AacEncoder {
 
+    /** Raw AAC frames + format, for putting inside an MP4. */
+    fun encodeTrack(samples: ShortArray, sampleRate: Int, bitRate: Int = 160_000, onProgress: (Float) -> Unit = {}): AacTrack {
+        val frames = ArrayList<AacFrame>()
+        val format = encodeWith(samples, sampleRate, bitRate, onProgress) { buf, info ->
+            val arr = ByteArray(info.size)
+            buf.get(arr)
+            frames.add(AacFrame(arr, info.presentationTimeUs))
+        }
+        return AacTrack(format, frames)
+    }
+
+    /** A standalone .aac file (ADTS stream). */
     fun encode(samples: ShortArray, sampleRate: Int, bitRate: Int = 160_000, onProgress: (Float) -> Unit = {}): ByteArray {
+        val out = ByteArrayOutputStream(samples.size / 4 + 1024)
+        var frame = ByteArray(4096)
+        encodeWith(samples, sampleRate, bitRate, onProgress) { buf, info ->
+            if (frame.size < info.size) frame = ByteArray(info.size)
+            buf.get(frame, 0, info.size)
+            out.write(Adts.header(info.size, sampleRate, 1))
+            out.write(frame, 0, info.size)
+        }
+        return out.toByteArray()
+    }
+
+    private fun encodeWith(
+        samples: ShortArray,
+        sampleRate: Int,
+        bitRate: Int,
+        onProgress: (Float) -> Unit,
+        sink: (ByteBuffer, MediaCodec.BufferInfo) -> Unit,
+    ): MediaFormat {
         val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
         }
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-        val out = ByteArrayOutputStream(samples.size / 4 + 1024)
+        var outFormat: MediaFormat = format
         try {
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             codec.start()
@@ -28,7 +64,6 @@ object AacEncoder {
             var inPos = 0
             var inputDone = false
             var outputDone = false
-            var frame = ByteArray(4096)
 
             while (!outputDone) {
                 if (!inputDone) {
@@ -51,16 +86,15 @@ object AacEncoder {
                 }
 
                 val outIdx = codec.dequeueOutputBuffer(info, 10_000)
-                if (outIdx >= 0) {
+                if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    outFormat = codec.outputFormat
+                } else if (outIdx >= 0) {
                     val isConfig = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
                     if (!isConfig && info.size > 0) {
                         val ob = codec.getOutputBuffer(outIdx)!!
                         ob.position(info.offset)
                         ob.limit(info.offset + info.size)
-                        if (frame.size < info.size) frame = ByteArray(info.size)
-                        ob.get(frame, 0, info.size)
-                        out.write(Adts.header(info.size, sampleRate, 1))
-                        out.write(frame, 0, info.size)
+                        sink(ob, info)
                     }
                     codec.releaseOutputBuffer(outIdx, false)
                     if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true
@@ -70,6 +104,6 @@ object AacEncoder {
         } finally {
             codec.release()
         }
-        return out.toByteArray()
+        return outFormat
     }
 }

@@ -7,9 +7,11 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
+import android.media.AudioTimestamp
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Process
+import android.os.SystemClock
 import com.takeone.RecordingService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,8 +19,12 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.abs
 import kotlin.math.max
 
-/** A finished recording, held only in RAM. */
-class Take(val samples: ShortArray, val sampleRate: Int)
+/**
+ * A finished recording, held only in RAM.
+ * [startedAtBootNs] is when sample 0 was captured (SystemClock.elapsedRealtimeNanos clock), used to
+ * line the audio up with video. 0 if unknown.
+ */
+class Take(val samples: ShortArray, val sampleRate: Int, val startedAtBootNs: Long = 0L)
 
 enum class RecStatus { IDLE, RECORDING, PAUSED }
 
@@ -133,11 +139,27 @@ object Recorder {
             var error: String? = null
             var hitLimit = false
             var actualDevice = label
+            var startBootNs = 0L
+            var fallbackStart = 0L
+            var tsTries = 0
+            val ts = AudioTimestamp()
 
             while (running) {
                 val n = rec.read(buf, 0, buf.size)
                 if (n < 0) { error = "The microphone stopped responding (code $n)."; break }
                 if (n == 0) continue
+                // Work out when the very first sample was captured (for audio/video sync).
+                if (startBootNs == 0L && tsTries < 50) {
+                    tsTries++
+                    if (rec.getTimestamp(ts, AudioTimestamp.TIMEBASE_BOOTTIME) == AudioRecord.SUCCESS) {
+                        startBootNs = ts.nanoTime - ts.framePosition * 1_000_000_000L / sampleRate
+                    } else if (tsTries == 50) {
+                        startBootNs = -1L
+                    }
+                }
+                if (store.size == 0 && startBootNs <= 0L && fallbackStart == 0L) {
+                    fallbackStart = SystemClock.elapsedRealtimeNanos() - n * 1_000_000_000L / sampleRate
+                }
                 var peak = 0
                 for (i in 0 until n) peak = max(peak, abs(buf[i].toInt()))
                 val level = peak / 32768f
@@ -170,7 +192,9 @@ object Recorder {
             running = false
 
             val samples = store.flatten()
-            if (samples.isNotEmpty()) _finished.value = Take(samples, sampleRate)
+            val start = if (startBootNs > 0L) startBootNs else fallbackStart
+            // Always report the end of a take (even an empty one) so a video recording can be paired with it.
+            _finished.value = Take(samples, sampleRate, start)
             _state.value = RecState(sampleRate = sampleRate, error = error, hitLimit = hitLimit)
             // Ask the foreground service to wind down (it stops itself once it has started).
             try {
