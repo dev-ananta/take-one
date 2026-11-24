@@ -49,7 +49,7 @@ class RecordingService : Service() {
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_mic)
             .setContentTitle("Recording")
-            .setContentText("Kept in memory only — tap to return")
+            .setContentText("Tap to return to TakeOne")
             .setOngoing(true)
             .setContentIntent(open)
             .addAction(0, "Stop", stop)

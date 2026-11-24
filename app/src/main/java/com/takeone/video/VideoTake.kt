@@ -5,12 +5,11 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.os.Build
-import androidx.annotation.RequiresApi
+import java.io.File
 
-/** A finished camera recording held in a RAM-only file, plus what the editor needs to know about it. */
-@RequiresApi(30)
+/** A finished camera recording (video only, in the app's cache), plus what the editor needs to know about it. */
 class VideoTake(
-    val file: MemFd,
+    val file: File,
     val durationUs: Long,
     val keyframesUs: LongArray,
     val width: Int,
@@ -21,13 +20,10 @@ class VideoTake(
 ) {
     /** Grabs single frames for the editor's preview. Not thread-safe: use from one thread. */
     private var retriever: MediaMetadataRetriever? = null
-    private var retrieverFd: android.os.ParcelFileDescriptor? = null
 
     fun frameAt(sourceUs: Long, exact: Boolean, maxWidth: Int = 720): Bitmap? = try {
         val r = retriever ?: MediaMetadataRetriever().also { mmr ->
-            val fd = file.openReader()
-            retrieverFd = fd
-            mmr.setDataSource(fd.fileDescriptor)
+            mmr.setDataSource(file.absolutePath)
             retriever = mmr
         }
         val option = if (exact) MediaMetadataRetriever.OPTION_CLOSEST else MediaMetadataRetriever.OPTION_PREVIOUS_SYNC
@@ -43,19 +39,16 @@ class VideoTake(
 
     fun release() {
         try { retriever?.release() } catch (_: Exception) {}
-        try { retrieverFd?.close() } catch (_: Exception) {}
         retriever = null
-        retrieverFd = null
-        file.close()
+        file.delete()
     }
 
     companion object {
         /** Reads duration, keyframe positions, size and rotation from a finished recording. */
-        fun probe(file: MemFd): VideoTake? {
-            val fd = file.openReader()
+        fun probe(file: File): VideoTake? {
             val ex = MediaExtractor()
             try {
-                ex.setDataSource(fd.fileDescriptor)
+                ex.setDataSource(file.absolutePath)
                 val track = (0 until ex.trackCount).firstOrNull {
                     ex.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
                 } ?: return null
@@ -76,11 +69,10 @@ class VideoTake(
                 val duration = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else last + frameUs
 
                 val mmr = MediaMetadataRetriever()
-                val fd2 = file.openReader()
                 val rotation = try {
-                    mmr.setDataSource(fd2.fileDescriptor)
+                    mmr.setDataSource(file.absolutePath)
                     mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-                } catch (e: Exception) { 0 } finally { mmr.release(); fd2.close() }
+                } catch (e: Exception) { 0 } finally { mmr.release() }
 
                 return VideoTake(
                     file = file,
@@ -92,10 +84,10 @@ class VideoTake(
                     baseUs = first,
                 )
             } catch (e: Exception) {
+                android.util.Log.e("TakeOneCamera", "probe failed", e)
                 return null
             } finally {
                 ex.release()
-                fd.close()
             }
         }
     }

@@ -1,15 +1,18 @@
 package com.takeone
 
+import android.Manifest
 import android.app.Application
-import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -22,15 +25,16 @@ import com.takeone.audio.AacEncoder
 import com.takeone.audio.AudioEdits
 import com.takeone.audio.InputDevice
 import com.takeone.audio.Player
+import com.takeone.audio.RecStatus
 import com.takeone.audio.Recorder
 import com.takeone.audio.SourceMode
 import com.takeone.audio.Take
+import com.takeone.audio.WavWriter
 import com.takeone.audio.describeOutputs
 import com.takeone.audio.listInputs
 import com.takeone.audio.supportsRaw
 import com.takeone.video.CameraController
 import com.takeone.video.Edl
-import com.takeone.video.MemFd
 import com.takeone.video.Mp4Exporter
 import com.takeone.video.VideoTake
 import com.takeone.video.alignAudio
@@ -40,20 +44,27 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
 
-enum class ExportFormat(val label: String, val ext: String, val hint: String) {
-    MP4("MP4", "mp4", "Video + sound (or sound only) — plays and posts almost anywhere"),
-    AAC("AAC", "aac", "Sound only, small file — for voice notes and audio apps"),
-}
+/** A take that has been saved to the phone. */
+class SavedTake(
+    val name: String,
+    val video: MediaSaver.Saved?,
+    val mainFile: MediaSaver.Saved,
+    val wav: MediaSaver.Saved?,
+)
 
 class RecorderViewModel(app: Application) : AndroidViewModel(app) {
 
+    private val ctx: Application get() = getApplication()
     private val am = app.getSystemService(AudioManager::class.java)
     private val main = Handler(Looper.getMainLooper())
     private val player = Player()
+    private val takesDir = File(app.cacheDir, "takes").apply { deleteRecursively(); mkdirs() }
 
     // ---- Devices --------------------------------------------------------------------------
     var inputs by mutableStateOf<List<InputDevice>>(emptyList()); private set
@@ -70,19 +81,20 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- Camera & live view on Mac --------------------------------------------------------
     val camera = CameraController(app)
-    /** Video needs Android 11+ (RAM-only files). */
-    val videoSupported: Boolean = MemFd.supported
-    var videoEnabled by mutableStateOf(MemFd.supported)
+    var videoEnabled by mutableStateOf(true)
+    var saveWav by mutableStateOf(true)
     var camLinkCode by mutableStateOf(""); private set
     var camLinkActive by mutableStateOf(false); private set
     var camLinkStatus by mutableStateOf(""); private set
     var camLinkLive by mutableStateOf(false); private set
     val camLinkBridge = CamLinkBridge(
-        camera,
+        capsProvider = { capsJson() },
+        onCommand = { handleMacCommand(it) },
         onStatus = { text, live -> camLinkStatus = text; camLinkLive = live },
-        onMessage = { message = it },
     )
     val camLinkUrl: String get() = "$CAMLINK_URL/?cam=$camLinkCode&src=app"
+
+    init { camLinkBridge.frameSource = camera }
 
     fun startCamLink(code: String) {
         camLinkCode = code.uppercase().filter { it.isLetterOrDigit() }.take(6)
@@ -100,7 +112,13 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
         camera.streaming = false
     }
 
+    // ---- Saving ---------------------------------------------------------------------------
+    var saving by mutableStateOf<String?>(null); private set
+    var saveProgress by mutableFloatStateOf(0f); private set
+    var lastSaved by mutableStateOf<SavedTake?>(null); private set
+
     // ---- Editor ---------------------------------------------------------------------------
+    var editorOpen by mutableStateOf(false); private set
     var take by mutableStateOf<ShortArray?>(null); private set
     var sampleRate by mutableIntStateOf(48000); private set
     var envelope by mutableStateOf(FloatArray(0)); private set
@@ -114,15 +132,12 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
     private val undo = ArrayDeque<Pair<ShortArray, Edl?>>()
     var canUndo by mutableStateOf(false); private set
 
-    // Video side of the take (null for audio-only takes)
     var video by mutableStateOf<VideoTake?>(null); private set
     var edl by mutableStateOf<Edl?>(null); private set
     var previewFrame by mutableStateOf<Bitmap?>(null); private set
     /** Fine-tunes lip sync on export: positive delays the sound. */
     var syncMs by mutableIntStateOf(0)
-    private var exportFile: MemFd? = null
 
-    // Frame grabbing for the editor preview runs on its own single thread.
     private val frameExecutor = Executors.newSingleThreadExecutor()
     private val frameDispatcher = frameExecutor.asCoroutineDispatcher()
     private val frameRequests = MutableStateFlow(-1L)
@@ -141,7 +156,7 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
                     Recorder.consumeFinished()
                     if (camera.isRecording) camera.stopRecording() // mic stopped first (limit or error)
                     pendingAudio = t
-                    tryLoad()
+                    tryProcess()
                 }
             }
         }
@@ -172,28 +187,39 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
 
     val selectedInput: InputDevice? get() = inputs.firstOrNull { it.id == selectedInputId }
 
+    private fun micGranted() =
+        ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    /** Why recording can't start right now, or null if it can. */
+    private fun cannotRecordReason(): String? = when {
+        !micGranted() -> "Allow microphone access in TakeOne first"
+        editorOpen -> "Close the editor on the phone first"
+        saving != null -> "Still saving the last take"
+        else -> null
+    }
+
     // ---- Recording ------------------------------------------------------------------------
 
-    @SuppressLint("NewApi") // video paths only run when videoSupported (Android 11+)
     fun startRecording() {
-        val ctx = getApplication<Application>()
-        if (take != null) discard()
+        cannotRecordReason()?.let { message = it; return }
+        if (Recorder.isRunning) return
+        releaseTake()
         pendingAudio = null
         finishedVideo = null
         awaitingVideo = false
 
-        val ok = Recorder.start(ctx, selectedInput, mode)
-        if (!ok) return
+        if (!Recorder.start(ctx, selectedInput, mode)) return
         try {
             ContextCompat.startForegroundService(ctx, Intent(ctx, RecordingService::class.java))
         } catch (e: Exception) {
             message = "Recording works, but only while the app stays open on screen."
         }
-        if (videoEnabled && videoSupported) {
-            if (camera.bound && camera.startRecording { onVideoFinished(it) }) {
+        if (videoEnabled) {
+            val file = File(takesDir, "camera-${System.currentTimeMillis()}.mp4")
+            if (camera.bound && camera.startRecording(file) { onVideoFinished(it) }) {
                 awaitingVideo = true
             } else {
-                message = "Camera isn't ready — recording sound only."
+                message = camera.error ?: "Camera isn't ready — recording sound only."
             }
         }
     }
@@ -203,55 +229,122 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
     fun stopRecording() { Recorder.stop(); camera.stopRecording() }
 
     private fun onVideoFinished(f: CameraController.Finished) {
-        if (Recorder.isRunning) Recorder.stop() // video hit its limit first
+        if (Recorder.isRunning) Recorder.stop()
         finishedVideo = f
         awaitingVideo = false
-        tryLoad()
+        tryProcess()
     }
 
-    private fun tryLoad() {
+    private fun tryProcess() {
         val audio = pendingAudio ?: return
         if (awaitingVideo) return
         val v = finishedVideo
         pendingAudio = null
         finishedVideo = null
-        viewModelScope.launch { load(audio, v) }
+        viewModelScope.launch { processAndSave(audio, v) }
     }
 
-    @SuppressLint("NewApi") // video paths only run when videoSupported (Android 11+)
-    private suspend fun load(audio: Take, v: CameraController.Finished?) {
-        player.stop()
-        var vt: VideoTake? = null
-        if (v != null) {
-            if (v.error != null) {
-                message = v.error + " — kept the sound."
-                v.file.close()
-            } else {
-                vt = withContext(Dispatchers.IO) { VideoTake.probe(v.file) }
-                if (vt == null) { message = "The video couldn't be read — kept the sound."; v.file.close() }
+    /** Lines up sound and picture, then saves the take to the phone (MP4, plus WAV of the mic). */
+    private suspend fun processAndSave(audio: Take, v: CameraController.Finished?) {
+        saving = "Saving"
+        saveProgress = 0f
+        try {
+            var vt: VideoTake? = null
+            if (v != null) {
+                if (v.error != null) {
+                    message = v.error + " — saved the sound only."
+                    v.file.delete()
+                } else {
+                    vt = withContext(Dispatchers.IO) { VideoTake.probe(v.file) }
+                    if (vt == null) { message = "The video file couldn't be read — saved the sound only."; v.file.delete() }
+                }
             }
-        }
-        if (vt == null && audio.samples.isEmpty()) return
+            if (vt == null && audio.samples.isEmpty()) { message = "Nothing was recorded."; return }
 
-        sampleRate = audio.sampleRate
-        undo.clear(); canUndo = false
-        syncMs = 0
-        title = "Take " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("MMM d h.mm a"))
-        previewFrame = null
-        video = vt
-        if (vt != null) {
-            val offsetNs = if (audio.startedAtBootNs > 0 && v!!.startedAtBootNs > 0) audio.startedAtBootNs - v.startedAtBootNs else 0L
-            val aligned = withContext(Dispatchers.Default) {
-                alignAudio(audio.samples, audio.sampleRate, offsetNs, vt.durationUs)
+            val rate = audio.sampleRate
+            val samples = if (vt != null) {
+                val offsetNs = if (audio.startedAtBootNs > 0 && v!!.startedAtBootNs > 0) audio.startedAtBootNs - v.startedAtBootNs else 0L
+                withContext(Dispatchers.Default) { alignAudio(audio.samples, rate, offsetNs, vt.durationUs) }
+            } else audio.samples
+            val whole = vt?.let { Edl.whole(it.durationUs, it.keyframesUs) }
+            val name = "TakeOne " + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH.mm.ss"))
+
+            val saved = withContext(Dispatchers.IO) {
+                val track = AacEncoder.encodeTrack(samples, rate) { p -> saveProgress = p * 0.5f }
+                val tmp = File(takesDir, "out.mp4")
+                Mp4Exporter.export(vt, whole, track, tmp) { p -> saveProgress = 0.5f + p * 0.3f }
+                val primary = if (vt != null) MediaSaver.saveVideo(ctx, "$name.mp4", MediaSaver.copyFrom(tmp))
+                else MediaSaver.saveAudio(ctx, "$name.mp4", "audio/mp4", MediaSaver.copyFrom(tmp))
+                tmp.delete()
+                saveProgress = 0.85f
+                val wav = if (saveWav && samples.isNotEmpty())
+                    MediaSaver.saveAudio(ctx, "$name.wav", "audio/x-wav") { WavWriter.write(it, samples, rate) }
+                else null
+                saveProgress = 1f
+                SavedTake(name, if (vt != null) primary else null, primary, wav)
             }
-            edl = Edl.whole(vt.durationUs, vt.keyframesUs)
-            setSamples(aligned, resetSelection = true)
-        } else {
-            edl = null
-            setSamples(audio.samples, resetSelection = true)
+            lastSaved = saved
+
+            // Keep the take loaded so it can be opened in the editor.
+            sampleRate = rate
+            video = vt
+            edl = whole
+            undo.clear(); canUndo = false
+            syncMs = 0
+            title = name
+            previewFrame = null
+            setSamples(samples, resetSelection = true)
+            requestFrame(0)
+        } catch (e: Exception) {
+            Log.e("TakeOne", "save failed", e)
+            message = "Couldn't save the take: ${e.message}"
+        } finally {
+            saving = null
         }
-        requestFrame(0)
     }
+
+    // ---- Mac (CamLink) ---------------------------------------------------------------------
+
+    /** Everything the Mac shows: camera abilities + recording state. Called from the WebView thread. */
+    private fun capsJson(): String {
+        val rec = Recorder.state.value
+        return camera.capsJson().apply {
+            put("app", true)
+            put("recording", rec.status != RecStatus.IDLE)
+            put("paused", rec.status == RecStatus.PAUSED)
+            put("elapsedMs", if (rec.sampleRate > 0) rec.samples.toLong() * 1000L / rec.sampleRate else 0L)
+            put("withVideo", videoEnabled && camera.bound)
+            put("mic", selectedInput?.let { if (it.detail.isNotBlank()) "${it.label} (${it.detail.substringBefore(" ·")})" else it.label } ?: "Default mic")
+            val reason = if (rec.status == RecStatus.IDLE) cannotRecordReason() else null
+            put("canRecord", reason == null)
+            if (reason != null) put("reason", reason)
+            saving?.let { put("saving", "$it ${(saveProgress * 100).toInt()}%") }
+            lastSaved?.let { put("lastSaved", it.name) }
+        }.toString()
+    }
+
+    private fun handleMacCommand(m: JSONObject) {
+        when (m.optString("type")) {
+            "record" -> {
+                when (m.optString("action")) {
+                    "start" -> startRecording()
+                    "stop" -> stopRecording()
+                    "pause" -> pause()
+                    "resume" -> resume()
+                }
+            }
+            "flip" -> { if (!camera.flip()) message = "Can't switch cameras while recording." }
+            "torch" -> { camera.setTorch(m.optBoolean("on")) }
+            "zoom" -> { camera.setZoom(m.optDouble("value", 1.0).toFloat()) }
+            "quality" -> { camera.streamMaxEdge = if (m.optInt("value") >= 1080) 1280 else 960 }
+            else -> {}
+        }
+    }
+
+    // ---- Editor ---------------------------------------------------------------------------
+
+    fun openEditor() { if (take != null) { editorOpen = true; requestFrame(selStart) } }
+    fun closeEditor() { player.stop(); playhead = null; editorOpen = false }
 
     private fun setSamples(s: ShortArray, resetSelection: Boolean) {
         take = s
@@ -266,8 +359,6 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
     private fun us(sample: Int): Long = sample.toLong() * 1_000_000L / sampleRate
     private fun samplesAt(us: Long): Int = (us * sampleRate / 1_000_000L).toInt()
     private fun requestFrame(sample: Int) { if (video != null) frameRequests.value = us(sample) }
-
-    // ---- Selection & playback -------------------------------------------------------------
 
     fun setSelection(start: Int, end: Int) {
         val n = take?.size ?: return
@@ -300,8 +391,6 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
             playhead = null
         }
     }
-
-    // ---- Edits ----------------------------------------------------------------------------
 
     private fun edit(label: String, resetSelection: Boolean, op: (ShortArray) -> Pair<ShortArray, Edl?>) {
         val s = take ?: return
@@ -365,9 +454,10 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
         requestFrame(0)
     }
 
-    @SuppressLint("NewApi") // video paths only run when videoSupported (Android 11+)
-    fun discard() {
+    /** Frees the loaded take (its saved files stay on the phone). */
+    private fun releaseTake() {
         player.stop(); playhead = null
+        editorOpen = false
         take = null
         envelope = FloatArray(0)
         undo.clear(); canUndo = false
@@ -376,67 +466,73 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
         val vt = video
         video = null
         if (vt != null) frameExecutor.execute { vt.release() } // after any frame grab in progress
-        exportFile?.close(); exportFile = null
-        MemoryAudioProvider.clear()
     }
 
-    // ---- Posting --------------------------------------------------------------------------
+    // ---- Saving the edited version & sharing ----------------------------------------------
 
-    @SuppressLint("NewApi") // video paths only run when videoSupported (Android 11+)
-    fun export(format: ExportFormat, onReady: (Intent) -> Unit) {
+    /** Saves the edited take as a new file on the phone, then opens the share sheet. */
+    fun saveEdited(format: ExportFormat, onReady: (Intent) -> Unit) {
         val s = take ?: return
         if (busy != null) return
-        if (format == ExportFormat.MP4 && !videoSupported) {
-            message = "MP4 needs Android 11 or newer on this phone — use AAC."
-            return
-        }
         player.stop(); playhead = null
-        busy = "Preparing ${format.label}"
+        busy = "Saving ${format.label}"
         progress = 0f
-        val ctx = getApplication<Application>()
-        val name = sanitize(title).ifBlank { "Take" } + "." + format.ext
+        val base = sanitize(title).ifBlank { "Take" } + " (edited)"
         val vt = video
         val e = edl
         val sync = syncMs
         val rate = sampleRate
         viewModelScope.launch {
             try {
-                val uri = when (format) {
-                    ExportFormat.AAC -> {
-                        val bytes = withContext(Dispatchers.Default) { AacEncoder.encode(s, rate) { p -> progress = p } }
-                        MemoryAudioProvider.publish(ctx, bytes, "audio/aac", name)
-                    }
-                    ExportFormat.MP4 -> {
-                        val file = withContext(Dispatchers.Default) {
+                val saved = withContext(Dispatchers.IO) {
+                    when (format) {
+                        ExportFormat.AAC -> {
+                            val bytes = AacEncoder.encode(s, rate) { p -> progress = p }
+                            MediaSaver.saveAudio(ctx, "$base.aac", "audio/aac") { it.write(bytes) }
+                        }
+                        ExportFormat.MP4 -> {
                             val audio = if (vt != null && e != null) alignAudio(s, rate, sync * 1_000_000L, e.durationUs) else s
                             val track = AacEncoder.encodeTrack(audio, rate) { p -> progress = p * 0.4f }
-                            Mp4Exporter.export(vt, e, track) { p -> progress = 0.4f + p * 0.6f }
+                            val tmp = File(takesDir, "edited.mp4")
+                            Mp4Exporter.export(vt, e, track, tmp) { p -> progress = 0.4f + p * 0.5f }
+                            val out = if (vt != null) MediaSaver.saveVideo(ctx, "$base.mp4", MediaSaver.copyFrom(tmp))
+                            else MediaSaver.saveAudio(ctx, "$base.mp4", "audio/mp4", MediaSaver.copyFrom(tmp))
+                            tmp.delete()
+                            out
                         }
-                        exportFile?.close()
-                        exportFile = file
-                        MemoryAudioProvider.publish(ctx, file, if (vt != null) "video/mp4" else "audio/mp4", name)
+                        ExportFormat.WAV -> MediaSaver.saveAudio(ctx, "$base.wav", "audio/x-wav") { WavWriter.write(it, s, rate) }
                     }
                 }
-                val mime = ctx.contentResolver.getType(uri) ?: "*/*"
-                val send = Intent(Intent.ACTION_SEND).apply {
-                    type = mime
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    putExtra(Intent.EXTRA_TITLE, name)
-                    clipData = ClipData.newRawUri(name, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                }
-                onReady(Intent.createChooser(send, "Post \"$name\"").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                message = "Saved to ${saved.folder}"
+                onReady(shareIntent(saved.uri, saved.displayName))
             } catch (ex: Exception) {
-                message = "Couldn't prepare the file: ${ex.message}"
+                Log.e("TakeOne", "export failed", ex)
+                message = "Couldn't save: ${ex.message}"
             } finally {
                 busy = null
             }
         }
     }
 
+    fun shareLast(onReady: (Intent) -> Unit) {
+        val t = lastSaved ?: return
+        onReady(shareIntent(t.mainFile.uri, t.mainFile.displayName))
+    }
+
+    private fun shareIntent(uri: Uri, name: String): Intent {
+        val mime = ctx.contentResolver.getType(uri) ?: "*/*"
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = mime
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_TITLE, name)
+            clipData = ClipData.newRawUri(name, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        return Intent.createChooser(send, "Post \"$name\"").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+
     private fun sanitize(s: String) = s.trim().replace(Regex("[^A-Za-z0-9 ._-]"), "_").take(60)
 
-    @SuppressLint("NewApi") // video paths only run when videoSupported (Android 11+)
     override fun onCleared() {
         am.unregisterAudioDeviceCallback(deviceCallback)
         player.stop()
@@ -444,7 +540,12 @@ class RecorderViewModel(app: Application) : AndroidViewModel(app) {
         val vt = video
         if (vt != null) frameExecutor.execute { vt.release() }
         frameExecutor.shutdown()
-        exportFile?.close()
         super.onCleared()
     }
+}
+
+enum class ExportFormat(val label: String, val hint: String) {
+    MP4("MP4", "Video + sound (or sound only) — plays and posts almost anywhere"),
+    WAV("WAV", "Sound only, lossless — best for editing elsewhere"),
+    AAC("AAC", "Sound only, small file — for voice notes and audio apps"),
 }

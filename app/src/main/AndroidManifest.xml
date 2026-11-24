@@ -11,15 +11,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Saving takes on Android 8–9 (newer versions save through MediaStore without a permission) -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
     <uses-feature android:name="android.hardware.microphone" android:required="true" />
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
     <!--
-        allowBackup is off and nothing is written to storage: recordings live only in RAM.
-        largeHeap gives room for long takes (about 5.5 MB per minute of sound in memory).
-        Video goes into RAM-only files (memfd), about 45 MB per minute.
+        Finished takes are saved to Movies/TakeOne (MP4) and Music/TakeOne (WAV).
+        largeHeap gives room for long takes (sound is edited in memory, about 5.5 MB per minute).
     -->
     <application
         android:allowBackup="false"
@@ -34,6 +35,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -46,10 +48,5 @@
             android:exported="false"
             android:foregroundServiceType="microphone" />
 
-        <provider
-            android:name=".MemoryAudioProvider"
-            android:authorities="${applicationId}.memory"
-            android:exported="false"
-            android:grantUriPermissions="true" />
     </application>
 </manifest>

@@ -1,6 +1,7 @@
 package com.takeone.ui
 
 import android.annotation.SuppressLint
+import android.content.res.Configuration
 import android.graphics.Color as AndroidColor
 import android.view.ViewGroup
 import android.webkit.WebChromeClient
@@ -46,6 +47,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -66,22 +68,18 @@ fun CameraCard(vm: RecorderViewModel, recording: Boolean, hasPermission: Boolean
             Column(Modifier.weight(1f)) {
                 Text("CAMERA", color = Tk.Dim, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 Text(
-                    when {
-                        !vm.videoSupported -> "Video needs Android 11 or newer"
-                        vm.videoEnabled -> "Recording video + sound"
-                        else -> "Sound only"
-                    },
+                    if (vm.videoEnabled) "Recording video + sound" else "Sound only",
                     fontWeight = FontWeight.SemiBold,
                 )
             }
             Switch(
-                checked = vm.videoEnabled && vm.videoSupported,
+                checked = vm.videoEnabled,
                 onCheckedChange = { vm.videoEnabled = it },
-                enabled = vm.videoSupported && !recording,
+                enabled = !recording,
                 colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = Tk.Accent),
             )
         }
-        if (vm.videoEnabled && vm.videoSupported) {
+        if (vm.videoEnabled) {
             Spacer(Modifier.height(10.dp))
             if (!hasPermission) {
                 Button(
@@ -94,7 +92,7 @@ fun CameraCard(vm: RecorderViewModel, recording: Boolean, hasPermission: Boolean
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         (if (cam.facingBack) "Back camera" else "Front camera") +
-                            " · up to ${CameraController.MAX_VIDEO_MINUTES} min",
+                            " · saved to Movies/TakeOne",
                         color = Tk.Dim, fontSize = 13.sp, modifier = Modifier.weight(1f),
                     )
                     TextButton(onClick = { cam.flip() }, enabled = !recording && cam.bound) { Text("Flip") }
@@ -114,20 +112,26 @@ fun CameraCard(vm: RecorderViewModel, recording: Boolean, hasPermission: Boolean
 @Composable
 private fun CameraPreview(cam: CameraController) {
     val owner = LocalLifecycleOwner.current
-    AndroidView(
-        factory = { ctx ->
-            PreviewView(ctx).apply {
-                implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                scaleType = PreviewView.ScaleType.FILL_CENTER
-                cam.bind(owner, surfaceProvider)
-            }
-        },
-        modifier = Modifier
-            .fillMaxWidth()
-            .aspectRatio(16f / 9f)
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color.Black),
-    )
+    // The preview has the same shape as the video (16:9, upright when the phone is upright),
+    // so what you see here — and on the Mac — is exactly what gets recorded.
+    val portrait = LocalConfiguration.current.orientation != Configuration.ORIENTATION_LANDSCAPE
+    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        AndroidView(
+            factory = { ctx ->
+                PreviewView(ctx).apply {
+                    // TextureView mode lets the Mac live view copy frames from the preview.
+                    implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                    scaleType = PreviewView.ScaleType.FILL_CENTER
+                    cam.bind(owner, this)
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth(if (portrait) 0.62f else 1f)
+                .aspectRatio(if (portrait) 9f / 16f else 16f / 9f)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.Black),
+        )
+    }
     DisposableEffect(Unit) { onDispose { cam.unbind() } }
 }
 
@@ -170,9 +174,10 @@ fun MacLiveViewCard(vm: RecorderViewModel) {
                 }
                 OutlinedButton(onClick = vm::stopCamLink) { Text("Disconnect") }
             }
-            if (!vm.camera.liveViewSupported) {
-                Text("This phone can't stream and record video at the same time, so the live view is paused.", color = Color(0xFFFFC560), fontSize = 13.sp)
-            }
+            Text(
+                "Use Record on the Mac to start and stop TakeOne — it records with the mic selected above.",
+                color = Tk.Dim, fontSize = 12.sp,
+            )
             // The CamLink page does the streaming; it only needs to exist, so it's kept tiny.
             CamLinkWebView(vm, Modifier.fillMaxWidth().height(2.dp))
         }
@@ -261,4 +266,57 @@ fun SectionCard(content: @Composable () -> Unit) {
             .background(Tk.Card, RoundedCornerShape(16.dp))
             .padding(16.dp)
     ) { content() }
+}
+
+/** Shows saving progress, then the last saved take with Edit / Share. */
+@Composable
+fun LastTakeCard(vm: RecorderViewModel, onShare: () -> Unit) {
+    val saving = vm.saving
+    val last = vm.lastSaved
+    if (saving == null && last == null) return
+    SectionCard {
+        if (saving != null) {
+            Text("SAVING TO PHONE", color = Tk.Dim, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+            androidx.compose.material3.LinearProgressIndicator(
+                progress = { vm.saveProgress }, modifier = Modifier.fillMaxWidth(), color = Tk.Accent,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text("${(vm.saveProgress * 100).toInt()}% — adding your mic's sound to the video", color = Tk.Dim, fontSize = 13.sp)
+        } else if (last != null) {
+            Text("LAST TAKE — SAVED", color = Tk.Dim, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Text(last.name, fontWeight = FontWeight.SemiBold)
+            Text(
+                buildString {
+                    append(last.mainFile.folder)
+                    if (last.wav != null) append(" · mic WAV in ${last.wav.folder}")
+                },
+                color = Tk.Dim, fontSize = 13.sp,
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedButton(onClick = vm::openEditor, enabled = vm.take != null) { Text("Edit") }
+                Button(
+                    onClick = onShare,
+                    colors = ButtonDefaults.buttonColors(containerColor = Tk.Accent, contentColor = Color.Black),
+                ) { Text("Share…") }
+            }
+        }
+    }
+}
+
+@Composable
+fun SaveWavSwitch(vm: RecorderViewModel, enabled: Boolean) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("Also save the mic as WAV", fontWeight = FontWeight.SemiBold)
+            Text("Lossless copy of the sound for editing (Music/TakeOne)", color = Tk.Dim, fontSize = 13.sp)
+        }
+        Switch(
+            checked = vm.saveWav,
+            onCheckedChange = { vm.saveWav = it },
+            enabled = enabled,
+            colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = Tk.Accent),
+        )
+    }
 }

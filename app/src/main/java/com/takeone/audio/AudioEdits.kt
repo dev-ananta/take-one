@@ -120,8 +120,28 @@ object AudioEdits {
     }
 }
 
-/** Simple container formats that can be built entirely in memory. */
+/** 16-bit PCM WAV files. */
 object WavWriter {
+    /** Streams a WAV file to [out] without building it in memory first. */
+    fun write(out: java.io.OutputStream, samples: ShortArray, sampleRate: Int, channels: Int = 1) {
+        val header = encode(ShortArray(0), sampleRate, channels)
+        val dataLen = samples.size * 2
+        fun i32(o: Int, v: Int) { header[o] = v.toByte(); header[o + 1] = (v shr 8).toByte(); header[o + 2] = (v shr 16).toByte(); header[o + 3] = (v shr 24).toByte() }
+        i32(4, 36 + dataLen); i32(40, dataLen)
+        out.write(header)
+        val buf = ByteArray(64 * 1024)
+        var i = 0
+        while (i < samples.size) {
+            val n = minOf(buf.size / 2, samples.size - i)
+            for (k in 0 until n) {
+                val v = samples[i + k].toInt()
+                buf[2 * k] = v.toByte(); buf[2 * k + 1] = (v shr 8).toByte()
+            }
+            out.write(buf, 0, n * 2)
+            i += n
+        }
+    }
+
     fun encode(samples: ShortArray, sampleRate: Int, channels: Int = 1): ByteArray {
         val dataLen = samples.size * 2
         val out = ByteArray(44 + dataLen)
