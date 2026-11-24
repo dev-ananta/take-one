@@ -90,7 +90,7 @@ private fun MemoryBadge() {
     ) {
         Box(Modifier.size(6.dp).background(Tk.Accent, CircleShape))
         Spacer(Modifier.width(6.dp))
-        Text("In memory only · nothing saved to your phone", color = Tk.Accent, fontSize = 12.sp)
+        Text("Takes save automatically to Movies/TakeOne", color = Tk.Accent, fontSize = 12.sp)
     }
 }
 
@@ -151,7 +151,7 @@ fun RecorderScreen(
 
         // ---- Camera & live view on the Mac ------------------------------------------------
         CameraCard(vm, recording = active, hasPermission = cameraPermission, onRequestPermission = onRequestCamera)
-        if (vm.videoEnabled && vm.videoSupported && cameraPermission) MacLiveViewCard(vm)
+        if (vm.videoEnabled && cameraPermission) MacLiveViewCard(vm)
 
         // ---- Microphone picker ----------------------------------------------------------
         Card {
@@ -276,6 +276,11 @@ fun RecorderScreen(
             }
         }
         rec.error?.let { Text(it, color = Tk.Rec, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()) }
+
+        // ---- Saving / last take -----------------------------------------------------------
+        val context = LocalContext.current
+        LastTakeCard(vm, onShare = { vm.shareLast { intent -> context.startActivity(intent) } })
+        SectionCard { SaveWavSwitch(vm, enabled = !active) }
         Spacer(Modifier.height(24.dp))
     }
 }
@@ -291,9 +296,9 @@ fun EditorScreen(vm: RecorderViewModel) {
     val total = samples.size.coerceAtLeast(1)
     val context = LocalContext.current
     var showPost by remember { mutableStateOf(false) }
-    var confirmDiscard by remember { mutableStateOf(false) }
 
-    BackHandler { confirmDiscard = true }
+    // The take is already saved on the phone, so leaving the editor is safe.
+    BackHandler { vm.closeEditor() }
 
     Column(
         Modifier
@@ -377,7 +382,7 @@ fun EditorScreen(vm: RecorderViewModel) {
             Column {
                 Text(label + "…", color = Tk.Dim)
                 Spacer(Modifier.height(6.dp))
-                if (label.startsWith("Preparing") && vm.progress > 0f) {
+                if (label.startsWith("Saving") && vm.progress > 0f) {
                     LinearProgressIndicator(progress = { vm.progress }, modifier = Modifier.fillMaxWidth(), color = Tk.Accent)
                 } else {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Tk.Accent)
@@ -387,30 +392,30 @@ fun EditorScreen(vm: RecorderViewModel) {
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedButton(
-                onClick = { confirmDiscard = true },
+                onClick = vm::closeEditor,
                 modifier = Modifier.weight(1f).height(52.dp),
                 border = BorderStroke(1.dp, Tk.Line),
-            ) { Text("Discard", color = Tk.Rec) }
+            ) { Text("Close") }
             Button(
                 onClick = { showPost = true },
                 enabled = enabled,
                 modifier = Modifier.weight(1.6f).height(52.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Tk.Accent, contentColor = Color.Black),
-            ) { Text("Post…", fontWeight = FontWeight.Bold) }
+            ) { Text("Save & post…", fontWeight = FontWeight.Bold) }
         }
         Text(
-            "Posting hands the file to the app you choose (Messages, WhatsApp, Drive, email…) " +
-                "directly from memory. Closing TakeOne discards the take.",
+            "The original take is already saved. \"Save & post\" saves this edited version as a new file " +
+                "(marked \"edited\"), then lets you send it to any app.",
             color = Tk.Dim, fontSize = 12.sp,
         )
         Spacer(Modifier.height(24.dp))
     }
 
     if (showPost) {
-        var format by remember { mutableStateOf(if (vm.videoSupported) ExportFormat.MP4 else ExportFormat.AAC) }
+        var format by remember { mutableStateOf(ExportFormat.MP4) }
         AlertDialog(
             onDismissRequest = { showPost = false },
-            title = { Text("Post recording") },
+            title = { Text("Save & post") },
             text = {
                 Column {
                     ExportFormat.entries.forEach { f ->
@@ -430,6 +435,7 @@ fun EditorScreen(vm: RecorderViewModel) {
                     val est = when (format) {
                         ExportFormat.MP4 -> seconds * (160_000 + if (vm.video != null) com.takeone.video.CameraController.VIDEO_BITRATE else 0) / 8
                         ExportFormat.AAC -> seconds * 160_000 / 8
+                        ExportFormat.WAV -> samples.size * 2L
                     }
                     Text("About ${"%.1f".format(est / 1_048_576.0)} MB", color = Tk.Dim, fontSize = 13.sp)
                 }
@@ -437,24 +443,13 @@ fun EditorScreen(vm: RecorderViewModel) {
             confirmButton = {
                 TextButton(onClick = {
                     showPost = false
-                    vm.export(format) { intent -> context.startActivity(intent) }
+                    vm.saveEdited(format) { intent -> context.startActivity(intent) }
                 }) { Text("Choose app") }
             },
             dismissButton = { TextButton(onClick = { showPost = false }) { Text("Cancel") } },
         )
     }
 
-    if (confirmDiscard) {
-        AlertDialog(
-            onDismissRequest = { confirmDiscard = false },
-            title = { Text("Discard this take?") },
-            text = { Text("It only exists in memory, so it will be gone for good.") },
-            confirmButton = {
-                TextButton(onClick = { confirmDiscard = false; vm.discard() }) { Text("Discard", color = Tk.Rec) }
-            },
-            dismissButton = { TextButton(onClick = { confirmDiscard = false }) { Text("Keep editing") } },
-        )
-    }
 }
 
 @Composable

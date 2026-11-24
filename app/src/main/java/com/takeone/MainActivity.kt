@@ -74,6 +74,21 @@ private fun App(vm: RecorderViewModel = viewModel()) {
         if (!ok) vm.message = "Without camera access TakeOne records sound only."
     }
 
+    // Ask for everything once at launch, so recording can also be started from the Mac.
+    val startupLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        cameraGranted = granted(Manifest.permission.CAMERA)
+        if (result[Manifest.permission.RECORD_AUDIO] == false) vm.message = "TakeOne needs microphone access to record."
+    }
+    LaunchedEffect(Unit) {
+        val wanted = buildList {
+            add(Manifest.permission.RECORD_AUDIO)
+            add(Manifest.permission.CAMERA)
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+            if (Build.VERSION.SDK_INT < 29) add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }.filterNot { granted(it) }
+        if (wanted.isNotEmpty()) startupLauncher.launch(wanted.toTypedArray())
+    }
+
     LaunchedEffect(vm.message) {
         vm.message?.let { snack.showSnackbar(it); vm.message = null }
     }
@@ -83,7 +98,7 @@ private fun App(vm: RecorderViewModel = viewModel()) {
 
     Scaffold(containerColor = Tk.Bg, snackbarHost = { SnackbarHost(snack) }) { pad ->
         Box(Modifier.fillMaxSize().padding(pad)) {
-            if (vm.take != null && rec.status == RecStatus.IDLE) EditorScreen(vm)
+            if (vm.editorOpen && vm.take != null && rec.status == RecStatus.IDLE) EditorScreen(vm)
             else RecorderScreen(
                 vm, rec,
                 cameraPermission = cameraGranted,

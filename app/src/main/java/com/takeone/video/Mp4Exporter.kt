@@ -4,30 +4,29 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
-import androidx.annotation.RequiresApi
 import com.takeone.audio.AacTrack
+import java.io.File
 import java.nio.ByteBuffer
 
 /**
- * Builds the final .mp4 in a RAM-only file:
+ * Builds an .mp4 file:
  *  - video: the kept pieces of the camera recording, copied without re-encoding (no quality loss)
  *  - audio: the edited microphone track, freshly encoded to AAC
  * Either track may be absent (audio-only MP4, or video with no sound).
  */
-@RequiresApi(30)
 object Mp4Exporter {
 
     fun export(
         video: VideoTake?,
         edl: Edl?,
         audio: AacTrack?,
+        out: File,
         onProgress: (Float) -> Unit = {},
-    ): MemFd {
+    ): File {
         require(video != null || audio != null) { "Nothing to export" }
-        val out = MemFd.create("takeone-export")
-        val muxer = MediaMuxer(out.pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        out.delete()
+        val muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         var extractor: MediaExtractor? = null
-        var readerFd: android.os.ParcelFileDescriptor? = null
         try {
             var videoTrack = -1
             var audioTrack = -1
@@ -35,9 +34,8 @@ object Mp4Exporter {
             var bufSize = 1 shl 20
 
             if (video != null && edl != null) {
-                readerFd = video.file.openReader()
                 val ex = MediaExtractor().also { extractor = it }
-                ex.setDataSource(readerFd.fileDescriptor)
+                ex.setDataSource(video.file.absolutePath)
                 srcTrack = (0 until ex.trackCount).first {
                     ex.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
                 }
@@ -103,12 +101,11 @@ object Mp4Exporter {
             onProgress(1f)
             return out
         } catch (e: Exception) {
-            out.close()
+            out.delete()
             throw e
         } finally {
             try { muxer.release() } catch (_: Exception) {}
             extractor?.release()
-            try { readerFd?.close() } catch (_: Exception) {}
         }
     }
 }
